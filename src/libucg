@@ -1,5 +1,17 @@
 -- libucg, library for encoding & decoding of UCG formatted data
-local version = "1.2.9"
+local version = "1.3.0"
+
+local doFastIO = false
+do
+	local s = string.dump(function() end)
+	if s:sub(1, 3) == string.char(27).."L".."J" then
+		doFastIO = true
+		-- check if in CCLite environment
+		-- CCLite is the only CC emulator whose io implementation handles strings with full 8-bit characters correctly
+		-- (Bug in LuaJ)
+	end
+end
+
 function getVersion()
 	return version
 end
@@ -7,42 +19,32 @@ end
 -------------------------------------
 ---------- UCG FILE FORMAT ----------
 -------------------------------------
-local formatVersion = 1
+local formatVersion = 2
 function getFormatVersion()
 	return formatVersion
 end
 
 local function newBuffer(mode, source)
 	local bytes = {}
+	local srcstr
 	local bits = {}
 	
 	if type(source) == "table" then
-		local b
-		for a = 1, #source do
-			b = source[a]
-			if type(b) == "number" and b >= 0 and b < 256 then
-				bytes[#bytes +1] = math.floor(b)
-			else
-				bytes[#bytes +1] = 0
-			end
-		end
+		bytes = source
 	elseif type(source) == "string" then
-		for a = 1, #source do
-			bytes[#bytes +1] = source:sub(a, a):byte()
-		end
+		srcstr = source
 	end
 	
-	local bitcache = {}
+	local bitcache = 0
 	local pointer = 1
 	local bitcounter = 0
+	local bytestr = ""
 	
 	local buf = {}
 	if mode == "w" then
-		bitcache = 0
-		buf.vcfaces = {}
-		
 		local function writeByteRaw(b)
 			bytes[pointer] = b
+			bytestr = bytestr..string.char(b)
 			pointer = pointer +1
 		end
 		
@@ -96,6 +98,7 @@ local function newBuffer(mode, source)
 		local function writeNumber(nbits, n)
 			if nbits == 1 then
 				writeBit(n)
+				return
 			end
 			
 			bitcache = (bitcache * 2^nbits) + n
@@ -112,15 +115,10 @@ local function newBuffer(mode, source)
 				writeByte(bs[a])
 			end
 		end
-		
 		function buf.writeBits(bits)
 			for a = 1, #bits do
 				writeBit(bits[a])
 			end
-		end
-		
-		function buf.writeChar(c)
-			writeByte(c:byte())
 		end
 		
 		function buf.writeWord(b)
@@ -135,7 +133,6 @@ local function newBuffer(mode, source)
 			
 			flushBitcacheReal()
 		end
-		
 		function buf.writeInteger(b)
 			if bitcounter == 0 then
 				local h1, h2, h3 = 2^24, 2^16, 2^8
@@ -165,232 +162,104 @@ local function newBuffer(mode, source)
 		function buf.getBytes()
 			return bytes
 		end
-		
-		function buf.writeToFile(path)
-			local w = fs.open(path, "wb")
-			for a = 1, #bytes do
-				w.write(bytes[a])
-			end
-			w.close()
-		end
-		
-		function buf.writeToBuffer(b)
-			if b.writeBytes and b.writeBits then
-				b.writeBytes(bytes)
-				b.writeBits(bitcache)
-			end
-		end
-		
-		function buf.readFromFile(path)
-			local r = fs.open(path, "rb")
-			local b = r.read()
-			while b do
-				buf.writeByte(b)
-				b = r.read()
-			end
-			r.close()
-		end
-		
-		function buf.readFromBuffer(r)
-			if r.readByte and r.readBit then
-				local b = r.readByte()
-				while b do
-					buf.writeByte(b)
-					b = r.readByte()
-				end
-				b = r.readBit()
-				while b do
-					buf.writeBit(b)
-					b = r.readBit()
-				end
-			end
+		function buf.getString()
+			return bytestr
 		end
 		
 		function buf.getSize()
 			return #bytes
 		end
-		
-		local ternaryCache = {} -- contains the decimal value for each ternary code
-		local ternaryToHuff = {}
-		local function writeTernary(t)
-			local v = ternaryCache[t]
-			bitcache = bitcache * 2^v.l + v.v
-			bitcounter = bitcounter + v.l
-			
-			if bitcounter >= 8 then
-				flushBitcacheReal()
-			end
-		end
-		buf.writeTernary = writeTernary
-		
+
 		function buf.newVariableCodeInterface()
 			local f = {}
-			
-			local vcodeToTernary = {}
-			local valueToTernary = {}
-			
+			local valueToHuff = {}
 			function f.loadCodes(t)
-				local n, n2, len
+				local v = 0
 				for a, b in pairs(t) do
-					n, n2, len = 0, 0, #b
-					for c = 1, len do
+					v = 0
+					for c = 1, #b do
 						if b[c] == 1 then
-							n = n + (3^(c-1))
-							n2 = n2 + (2^(len-c))
+							v = v + (2^(#b-c))
 						end
 					end
-					n = n + ((3^len)-1)/2
-					ternaryCache[n] = {l=len, v=n2}
-					
-					vcodeToTernary[b] = n
-					valueToTernary[a] = n
+					valueToHuff[a] = {l = #b, v = v}
 				end
-				
-				return valueToTernary, vcodeToTernary
+				return f
 			end
 			
-			function f.loadCode(value, code)
-				n, n2, len = 0, 0, #code
-				for a = 1, len do
-					if code[a] == 1 then
-						n = n + (3^(a-1))
-						n2 = n2 + (2^(len-c))
-					end
-				end
-				n = n + ((3^len)-1)/2
-				ternaryCache[n] = {l=len, v=n2}
-				
-				vcodeToTernary[code] = n
-				valueToTernary[value] = n
-				
-				return valueToTernary, vcodeToTernary
+			function f.writeValue(v)
+				local x = valueToHuff[v]
+				writeNumber(x.l, x.v)
+				return f
 			end
 			
-			function f.getConversion_valueToTernary()
-				return valueToTernary
-			end
-			
-			function f.getConversion_vcodeToTernary()
-				return vcodeToTernary
-			end
-			
-			f.writeTernary = writeTernary
-			
-			function f.writeValue(a)
-				local v = valueToTernary[a]
-				if v then
-					local x = ternaryCache[v]
-					local cacheBefore = bitcache
-					local counterBefore = bitcounter
-					bitcache = bitcache * 2^x.l + x.v
-					bitcounter = bitcounter + x.l
-					if bitcounter >= 8 then
-						flushBitcacheReal()
-					end
-				else
-					error("valueToTernary: Ternary value not found! Key: "..tostring(a), 2)
-				end
-			end
-			
-			function f.writeVCode(v)
-				local val = vcodeToTernary[v]
-				if val then
-					local v2 = ternaryCache[val]
-					bitcache = bitcache * 2^v2.l + v2.v
-					bitcounter = bitcounter + v2.l
-					
-					if bitcounter >= 8 then
-						flushBitcacheReal()
-					end
-				else
-					error("vcodeToTernary: Ternary value not found! Key: "..tostring(v), 2)
-				end
-			end
-			
-			local _ = setmetatable({}, {__index = f, __newindex = function() end, metatable = "protected"})
-			local id = #buf.vcfaces +1
-			f.id = id
-			buf.vcfaces[id] = _
-			return _, id
+			return f
 		end
 	elseif mode == "r" then
 		local function readByteRaw()
-			local b = bytes[pointer]
+			local b
+			if srcstr then
+				b = srcstr:sub(pointer, pointer):byte()
+			else
+				b = bytes[pointer]
+			end
 			pointer = pointer +1
+			
 			return b
 		end
+		local function updateCache()
+			bitcache = bitcache*256 + readByteRaw()
+			bitcounter = bitcounter +8
+		end
+		
+		local function readNumber(nbits)
+			while bitcounter < nbits do
+				updateCache()
+			end
+			if bitcounter == nbits then
+				bitcounter = 0
+				local v = bitcache
+				bitcache = 0
+				return v
+			else
+				local v = (bitcache - bitcache % 2^(bitcounter-nbits)) / 2^(bitcounter-nbits)
+				bitcache = bitcache % 2^(bitcounter-nbits)
+				bitcounter = bitcounter-nbits
+				return v
+			end
+		end
+		buf.readNumber = readNumber
 		
 		local function readBit()
-			if bitcache[1] == nil or bitpointer > 8 then
-				local by = readByteRaw()
-				if by then
-					bitcache = {
-						by >= 128,
-						(by % 128) >= 64,
-						(by % 64) >= 32,
-						(by % 32) >= 16,
-						(by % 16) >= 8,
-						(by % 8) >= 4,
-						(by % 4) >= 2,
-						(by % 2) >= 1
-					}
-				else
-					bitcache = {}
-				end
-				bitpointer = 1
+			if bitcounter == 0 then
+				updateCache()
 			end
-			
-			local b = bitcache[bitpointer]
-			bitpointer = bitpointer +1
-			if b == false then
-				return 0
-			elseif b == true then
-				return 1
-			end
-			return b
+			local v = (bitcache - bitcache % 2^(bitcounter-1)) / 2^(bitcounter-1)
+			bitcounter = bitcounter -1
+			bitcache = bitcache % 2^bitcounter
+			return v
 		end
 		buf.readBit = readBit
 		
-		local function readByte()
-			if bitpointer == 1 then
-				return readByteRaw()
-			else
-				return readBit()*128 + readBit()*64 + readBit()*32 + readBit()*16 + readBit()*8 + readBit()*4 + readBit()*2 + readBit()
-			end
-		end
-		buf.readByte = readByte
-		
-		function buf.readBits(nbits)
+		local function readBits(nbits)
 			local t = {}
 			for a = 1, nbits do
 				t[a] = readBit()
 			end
 			return t
 		end
+		buf.readBits = readBits
 		
-		function buf.readNumber(nbits)
-			if nbits <= 0 then
-				return
-			elseif nbits == 1 then
-				return readBit()
-			else
-				local n=0
-				for a=nbits-1, 0, -1 do
-					local bit = readBit()
-					if bit then
-						n=n+ bit*2^a
-					else
-						return nil
-					end
-				end
-				return n
-			end
+		local function readByte()
+			return readNumber(8)
 		end
+		buf.readByte = readByte
+		
 		function buf.readWord()
-			return readByte() * 256 + readByte()
+			return readNumber(16)
 		end
 		function buf.readInteger()
-			return readByte()*2^24 + readByte()*2^16 + readByte()*256 + readByte()
+			return readNumber(32)
 		end
 		
 	else
@@ -407,23 +276,20 @@ local function newBuffer(mode, source)
 		return mode
 	end
 	
-	return setmetatable({}, {__index=buf, __newindex=function() end, metatable="protected"})
+	return buf
 end
 
--- encodes an image and returns an array of bytes (w and h are optional)
-function writeBArray(tImage, w, h)
+local alphabet, iAlphabet
+do
+	alphabet = {6, 2, 10, 3, 11, 9, 8, 7, 12, 14, 1, 4, 5, 13, 15}
+	alphabet[0] = 0
+	iAlphabet = {}
+	for n = 0, #alphabet do iAlphabet[alphabet[n]] = n end
+end
+
+-- encodes an image and returns a string (w and h are optional)
+function encode(tImage, w, h)
 	-- first, count colors
-	local colorCounter={}				-- stores the amount of pixels per color (index = color code; value = pixels using it)
-	local lengthsCounter={}				-- counts the uses of different lengths
-	
-	local numPixels=0					-- number of colored pixels
-	local numColors=0					-- number of used colors
-	local numLengths=0					-- numbers of used lengths
-	
-	local simpleColorCodes={}			-- the used huffman tree if numColors is less or equal 1
-	local simpleLengthCodes={}
-	
-	local lengthImage={}
 	
 	if not w then
 		w = 0
@@ -435,209 +301,125 @@ function writeBArray(tImage, w, h)
 		h = #tImage
 	end
 	
-	local color, colorBefore, length, imageLine, lengthImageLine
-	for y=1, #tImage do
-		imageLine = tImage[y]
-		
-		lengthImage[y] = {}
-		lengthImageLine = lengthImage[y]
-		
-		colorBefore, length = nil, nil
-		for x=1, w do
-			color = imageLine[x] or 0
-			
-			if length == nil then
-				colorBefore = color
-				length = 0
-			end
-			
-			if color == colorBefore then
-				length = length +1
-			else
-				if not lengthsCounter[length] then
-					if numLengths < 2 then
-						simpleLengthCodes[length]={numLengths}
-					end
-					numLengths = numLengths +1
-				end
-				lengthImageLine[#lengthImageLine+1]={c=colorBefore, l=length}
-				lengthsCounter[length] = (lengthsCounter[length] or 0) +1
-				
-				if not colorCounter[colorBefore] then
-					if numColors < 2 then
-						simpleColorCodes[colorBefore] = {numColors}
-					end
-					numColors = numColors +1
-				end
-				colorCounter[colorBefore] = (colorCounter[colorBefore] or 0) +1
-				
-				length = 1
-				colorBefore = color
-			end
-			numPixels = numPixels +1
-		end
-		
-		if not lengthsCounter[length] then
-			if numLengths < 2 then
-				simpleLengthCodes[length] = {numLengths}
-			end
-			numLengths = numLengths +1
-		end
-		lengthImageLine[#lengthImageLine+1]={c=colorBefore, l=length}
-		lengthsCounter[length] = (lengthsCounter[length] or 0) +1
-		
-		if not colorCounter[colorBefore] then
-			if numColors < 2 then
-				simpleColorCodes[colorBefore] = {numColors}
-			end
-			numColors = numColors +1
-		end
-		colorCounter[colorBefore] = (colorCounter[colorBefore] or 0) +1
-	end
-	
 	if w > 65535 or h > 65535 then
 		return nil, "image too large"
+	end
+		
+	local function counterAdd(t, k)
+		if t[k] then
+			t[k].p = t[k].p +1
+		else
+			t[k] = {p = 1, v = {[k] = {}}, tree = k, k = k}
+		end
+	end
+	
+	local lengthCounter = {}
+	local indexCounter = {}
+	local fragments = {}
+	
+	local sCol, sIndex, sLen = 0, 0, 0
+	for y = 1, h do
+		
+		fragments[y] = {}
+		sLen = 0
+		for x = 1, w+1 do
+			color = tImage[y][x]
+			if color and color ~= 0 then
+				color = math.log(color)/math.log(2)
+			else
+				color = 16
+			end
+			
+			if x == 1 then sCol=color sIndex=iAlphabet[color] or 16 end
+			if x == w+1 then color = -1 end
+			
+			if sCol == color then
+				sLen = sLen +1
+			else
+				fragments[y][#fragments[y] +1] = {c = sCol, i = sIndex, l = sLen}
+				counterAdd(indexCounter, sIndex)
+				counterAdd(lengthCounter, sLen)
+				--print(sIndex)
+				
+				sLen = 1
+				if color == -1 then
+					sIndex = -1
+				elseif color == 16 then
+					sIndex = 16
+				elseif sCol == 16 then
+					sIndex = iAlphabet[color]
+					--print("index = ", sIndex)
+				else
+					sIndex = (iAlphabet[color] - iAlphabet[sCol]) % 16
+				end
+				sCol = color
+			end
+		end
 	end
 	
 	local buffer = newBuffer("w")
 	local writeByte, writeChar, writeBit, writeBits, writeNumber, finishByte, writeWord, writeInteger = 
 		buffer.writeByte, buffer.writeChar, buffer.writeBit, buffer.writeBits, buffer.writeNumber, buffer.finishByte, buffer.writeWord, buffer.writeInteger
 	
-	local function serCode(c, c2)
-		local s = ""
-		local c3 = c
-		if c2 then
-			c3 = {unpack(c)}
-			c3[#c3 +1] = c2
-		end
-		for a = 1, #c3 do
-			s = s..c3[a]
-		end
-		return s
-	end
-	
-	local function generateHuffmanTree(c)
-		local codes, low1p, low1v, low2p, low2v, lastkey = {}
-			-- the huffman codes,
-			-- the lowest probability of a color/node, the value of the color/node,
-			-- the 2nd lowest probability of a color/node, the value of the color/node
-		
-		local numentries
-		while true do
-			low1p = nil
-			low1v = -1
-			low2p = nil
-			low2v = -1
-			
-			numentries = 0
-			for a, b in pairs(c) do
-				if b then
-					if (low1p == nil) or (b < low1p) then
-						if (low2p == nil) or (low1p < low2p) then
-							low2p = low1p
-							low2v = low1v
-						end
-						low1p = b
-						low1v = a
-					elseif (low2p == nil) or (b < low2p) then
-						low2p = b
-						low2v = a
-					end
-					numentries = numentries +1
-				end
-			end
-			
-			c[low1v] = nil
-			c[low2v] = nil
-			lastkey = {[0]=low2v, [1]=low1v}
-			c[lastkey] = low1p+low2p
-			
-			if numentries <= 2 then
-				break
-			end
-		end
-		
-		local touch;
-		function touch(t, huffcode)
-			if type(t) == "number" then
-				codes[t] = {unpack(huffcode)}
-				return
-			else
-				huffcode[#huffcode +1] = 0
-				touch(t[0], huffcode)
-				huffcode[#huffcode] = 1
-				touch(t[1], huffcode)
-				huffcode[#huffcode] = nil
-			end
-		end
-		touch(lastkey, {})
-		
-		return codes, lastkey
-	end
-	
 	local function writeHufftree(tree, writeValue)
-		local towrite = {tree}
-		if not tree[1] then
-			writeBit(1)
-			writeValue(tree[0])
-			return
-		else
-			writeBit(0)
-		end
-		local towrite2, sub0, sub1
-		while #towrite ~= 0 do
+		local towrite, towrite2 = {tree}
+		while #towrite > 0 do
 			towrite2 = {}
 			for a = 1, #towrite do
-				sub0, sub1 = towrite[a][0], towrite[a][1]
-				if type(sub0) == "number" then
+				if type(towrite[a]) == "number" then
 					writeBit(1)
-					writeValue(sub0)
+					writeValue(towrite[a])
 				else
 					writeBit(0)
-					towrite2[#towrite2 +1] = sub0
-				end
-				if type(sub1) == "number" then
-					writeBit(1)
-					writeValue(sub1)
-				else
-					writeBit(0)
-					towrite2[#towrite2 +1] = sub1
+					towrite2[#towrite2 +1] = towrite[a][0]
+					towrite2[#towrite2 +1] = towrite[a][1]
 				end
 			end
-			towrite=towrite2
+			towrite = towrite2
 		end
 	end
 	
-	local function writePalette(hufftree)
-		writeHufftree(hufftree, function(v)
-			if v == 0 then
-				writeNumber(5, 16)
-			else
-				writeNumber(5, math.log(v)/math.log(2))
-			end
-		end)
-	end
-	
-	local function writeLengthTree(hufftree)
-		writeHufftree(hufftree, function(v)
-			if v <= 12 then
-				writeNumber(4, v)
-			else
-				local nbits = math.floor(math.log(v)/math.log(2)) +1
-				if nbits <= 5 then
-					writeNumber(4, 13)
-					writeNumber(5, v)
-				elseif nbits <= 8 then
-					writeNumber(4, 14)
-					writeNumber(8, v)
-				else
-					writeNumber(4, 15)
-					writeNumber(16, v)
+	local function generateHuffmanTree(c, writeValue)
+		local e1, e2, en;
+		
+		local numentries = 0
+		for _1, _2 in pairs(c) do numentries = numentries +1; en = _2 end
+		
+		while numentries > 1 do
+			e1, e2 = nil, nil
+			numentries = 0
+			
+			for _, e in pairs(c) do
+				if (e1 == nil) or (e.p < e1.p) then
+					if (e2 == nil) or (e1.p < e2.p) then
+						e2 = e1
+					end
+					e1 = e
+				elseif (e2 == nil) or (e.p < e2.p) then
+					e2 = e
 				end
+				numentries = numentries +1
 			end
-		end)
+			
+			c[e1.k] = nil
+			en = {k = e2.k, p = e1.p + e2.p, v = {}, tree = {[0] = e1.tree, [1] = e2.tree}}
+			for a, b in pairs(e1.v) do en.v[a] = {0, unpack(b)} end
+			for a, b in pairs(e2.v) do en.v[a] = {1, unpack(b)} end
+			c[e2.k] = en
+			
+			numentries = numentries -1
+		end
+		
+		if writeValue then
+			writeHufftree(en.tree, writeValue)
+			local face = buffer.newVariableCodeInterface()
+			face.loadCodes(en.v)
+			return face.writeValue
+		end
+		
+		return en.v, en.tree, e1 == nil
 	end
-	
+
 	-- Header: 0xFF2137
 	-- U is the 21st letter in the alphabet
 	-- C is the 3rd letter in the alphabet
@@ -653,83 +435,69 @@ function writeBArray(tImage, w, h)
 	writeWord(w)
 	writeWord(h)
 	
-	local monocolor = numColors == 1
-	local colorcodes, colortree
-	if numColors <= 2 then
-		-- less or equal 2 colors, huffman tree algorithm would fail
-		colorcodes = simpleColorCodes
-		colortree = {}
-		for a, b in pairs(simpleColorCodes) do
-			colortree[b[1]] = a
-		end
-	else
-		-- generate color huffman tree
-		colorcodes, colortree = generateHuffmanTree(colorCounter)
-	end
-	writePalette(colortree)
+	local iWrite = generateHuffmanTree(indexCounter,
+		function(v)
+			writeNumber(5, v)
+		end)
 	
-	local monolength = numLengths == 1
-	local lengthcodes, lengthtree
-	if numLengths <= 2 then
-		-- less or equal 2 lengths, huffman tree algorithm would fail
-		lengthcodes = simpleLengthCodes
-		lengthtree = {}
-		for a, b in pairs(simpleLengthCodes) do
-			lengthtree[b[1]] = a
-		end
-	else
-		-- generate length huffman tree
-		lengthcodes, lengthtree = generateHuffmanTree(lengthsCounter)
-	end
-	writeLengthTree(lengthtree)
-	
-	local cFace, cWrite
-	if not monocolor then
-		cFace = buffer.newVariableCodeInterface()
-		cFace.loadCodes(colorcodes)
-		cWrite = cFace.writeValue
-	end
-	
-	local lFace, lWrite
-	if not monolength then
-		lFace = buffer.newVariableCodeInterface()
-		lFace.loadCodes(lengthcodes)
-		lWrite = lFace.writeValue
-	end
+	local lWrite = generateHuffmanTree(lengthCounter,
+		function(v)
+			if v <= 12 then
+				writeNumber(4, v)
+			else
+				local nbits = math.ceil(math.log(v+1)/math.log(2))
+				if nbits <= 5 then
+					writeNumber(4, 13)
+					writeNumber(5, v)
+				elseif nbits <= 8 then
+					writeNumber(4, 14)
+					writeNumber(8, v)
+				else
+					writeNumber(4, 15)
+					writeNumber(16, v)
+				end
+			end
+		end)
 	
 	-- write image data
+	local line
 	for y = 1, h do
-		local line = lengthImage[y]
-		local dx = 0
+		line = fragments[y]
 		for x = 1, #line do
-			local p = line[x]
-			if not monocolor then
-				cWrite(p.c)
-			end
-			if not monolength then
-				lWrite(p.l)
-			end
-			dx = dx + p.l
+			iWrite(line[x].i)
+			lWrite(line[x].l)
 		end
 	end
 	
 	finishByte(0)
 	
-	return buffer.getBytes()
+	if doFastIO then
+		return buffer.getString()
+	else
+		return buffer.getBytes()
+	end
 end
+
 -- encodes an image an writes it to a file
 function writeFile(path, tImage)
 	if type(path) ~= "string" then error("Argument #1: string expected", 2) end
 	if type(tImage) ~= "table" then error("Argument #2: table expected", 2) end
 	if not fs.isDir(path) and not fs.isReadOnly(path) then
-		local barray, err = writeBArray(tImage)
-		if barray then
-			local w = fs.open(path, "wb")
-			for a = 1, #barray do
-				w.write(barray[a])
+		local b, err = encode(tImage)
+		if b then
+			if doFastIO then
+				local w = fs.open(path, "w")
+				w.write(bstring)
+				w.close()
+			else
+				local w = fs.open(path, "wb")
+				for _ = 1, #b do
+					w.write(b[_])
+				end
+				w.close()
 			end
 		else
-			return false, err
+			error(err)
 		end
 	else
 		error("Can't write to "..path, 2)
@@ -738,8 +506,8 @@ function writeFile(path, tImage)
 end
 
 -- decodes an array of bytes in UCG format and returns an image
-function readBArray(bytes)
-	local buffer = newBuffer("r", bytes)
+function decode(source)
+	local buffer = newBuffer("r", source)
 	local readNumber, readWord, readBits, readBit, readByte = buffer.readNumber, buffer.readWord, buffer.readBits, buffer.readBit, buffer.readByte
 	
 	local sign = 0xFF2137
@@ -747,75 +515,60 @@ function readBArray(bytes)
 		return nil, false, "invalid signature! "..tostring(n)
 	end
 	
+	
 	local version = readByte()
 	
 	local tImage = {}
-	if version == 1 then
+	if version == 2 then
+		
 		local flags, w, h = readBits(8), readWord(), readWord()
 		
-		local function serCode(c, c2)
-			local s = ""
-			local c3 = c
-			if c2 then
-				c3 = {unpack(c)}
-				c3[#c3 +1] = c2
-			end
-			for a = 1, #c3 do
-				s = s..c3[a]
-			end
-			return s
-		end
-		
 		local function readHuffmanTree(readValue)
-			local tricodes = {}
-			local toread = {0}
+			local codes = {}
+			local toread = {1}
 			local toread2
-			local depth = 0
+			local length = 0
+			local minLength = 0
 			
 			if readBit() == 1 then
 				return readValue(), true
 			end
 			
-			local ternary, digitValue, c0, c1
+			local bin, c0, c1;
 			while #toread > 0 do
 				toread2 = {}
-				digitValue = 3^depth
-				
+				length = length +1
 				for a = 1, #toread do
-					ternary = toread[a]
-					c0, c1 = ternary + digitValue, ternary + 2*digitValue
+					bin = toread[a]
+					c0, c1 = bin*2, bin*2 +1
 					
 					if readBit() == 1 then
+						if minLength == 0 then minLength = length end
 						local v = readValue()
-						tricodes[c0] = v
+						codes[c0] = v
 					else
 						toread2[#toread2 +1] = c0
 					end
 					
 					if readBit() == 1 then
+						if minLength == 0 then minLength = length end
 						local v = readValue()
-						tricodes[c1] = v
+						codes[c1] = v
 					else
 						toread2[#toread2 +1] = c1
 					end
 				end
-				depth = depth +1
 				toread = toread2
 			end
 			
-			return tricodes
+			return codes, nil, minLength
 		end
 		
-		local colorcodes, monocolor = readHuffmanTree(function()
-			local b = readNumber(5)
-			if b == 16 then
-				return 0
-			else
-				return 2^b
-			end
+		local indexcodes, monoindex, minIClength = readHuffmanTree(function()
+			return readNumber(5)
 		end)
 		
-		local lengthcodes, monolength = readHuffmanTree(function()
+		local lengthcodes, monolength, minLClength = readHuffmanTree(function()
 			local b = readNumber(4)
 			if b <= 12 then
 				return b
@@ -830,42 +583,50 @@ function readBArray(bytes)
 		
 		local debX, debY, debColor
 		
-		local function lexHuffcode(dictionary, nodedictionary)
-			local ternary = 0
-			local depth = 0
-			local v
+		local function lexHuffcode(dictionary, minlength)
+			local bin = 2^minlength + readNumber(minlength)
+			v = dictionary[bin]
+			if v then return v end
 			while not v do
-				local bi = readBit()
-				ternary = ternary + (bi+1)*(3^depth)
-				depth = depth +1
-				v = dictionary[ternary]
+				bin = bin*2 + readBit()
+				v = dictionary[bin]
 			end
 			return v
 		end
 		
+		local color, index, len, x, lastColor, z
 		for y = 1, h do
 			tImage[y] = {}
-			local x = 0
+			x = 0
+			lastColor = 16
 			while x < w do
-				debX, debY = x, y
-				local color
-				if monocolor then
-					color = colorcodes
+				if monoindex then
+					index = indexcodes
 				else
-					color = lexHuffcode(colorcodes, colornodecodes)
-					debColor = color
+					index = lexHuffcode(indexcodes, minIClength)
 				end
-				local len
 				if monolength then
 					len = lengthcodes
 				else
-					len = lexHuffcode(lengthcodes, lengthnodecodes)
-					debX, debY, debColor = nil, nil, nil
+					len = lexHuffcode(lengthcodes, minLClength)
 				end
+				if index == 16 then
+					color = 16
+					z = 0
+				elseif lastColor == 16 then
+					color = alphabet[index]
+					z = 2^color
+				else
+					color = alphabet[(iAlphabet[lastColor] + index) % 16]
+					z = 2^color
+				end
+				
 				for a = 1, len do
-					tImage[y][#tImage[y]+1] = color
+					tImage[y][#tImage[y]+1] = z
 				end
 				x = x + len
+				
+				lastColor = color
 			end
 		end
 		return tImage, true
@@ -873,24 +634,27 @@ function readBArray(bytes)
 		return nil, false, "unsupported version: "..(tostring(version) or "unknown")
 	end
 end
+
 -- decodes a file in UCG format and returns an image
 function readFile(path)
 	if type(path) ~= "string" then error("Argument #1: string expected", 2) end
 	if not fs.isDir(path) and fs.exists(path) then
-		local barray = {}
-		local b
-		
-		local r = fs.open(path, "rb")
-		while true do
-			b = r.read()
-			if b == nil then
-				break
+		local s
+		if doFastIO then 
+			local r = fs.open(path, "r")
+			s = r.readAll()
+			r.close()
+		else
+			local r = fs.open(path, "rb")
+			local b = r.read()
+			s = {}
+			while b do
+				s[#s +1] = b
+				b = r.read()
 			end
-			barray[#barray +1] = b
+			r.close()
 		end
-		r.close()
-		
-		return readBArray(barray)
+		return decode(s)
 	else
 		error("Can't read from "..path, 2)
 	end
